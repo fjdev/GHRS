@@ -393,26 +393,46 @@ class ArchiveExtractor:
         except (zipfile.BadZipFile, tarfile.TarError) as e:
             raise ExtractionError(f"Failed to extract archive: {e}")
         
+        # Handle GitHub release archives which wrap everything in a root directory
+        roots = [p for p in dest_dir.iterdir() if p.is_dir()]
+        if len(roots) == 1 and not subdir:
+            # Single root directory - unwrap it (GitHub tarball/zipball case)
+            root = roots[0]
+            tmp = Path(tempfile.mkdtemp(prefix="ghrs_unwrap_"))
+            
+            try:
+                for item in root.iterdir():
+                    if item.is_dir():
+                        shutil.copytree(item, tmp / item.name, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(item, tmp / item.name)
+                
+                ensure_clean_dir(dest_dir)
+                shutil.copytree(tmp, dest_dir, dirs_exist_ok=True)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        
         if subdir:
             roots = [p for p in dest_dir.iterdir() if p.is_dir()]
-            base = roots[0] if roots else dest_dir
-            src = (base / subdir).resolve()
+            if not roots:
+                raise ExtractionError(f"No directories found in archive")
             
+            src = (roots[0] / subdir).resolve()
             if not src.exists():
                 raise ExtractionError(f"Subdir '{subdir}' not found in archive")
             
-            tmp = dest_dir / "__tmp__"
-            ensure_clean_dir(tmp)
-            
-            for item in src.iterdir():
-                if item.is_dir():
-                    shutil.copytree(item, tmp / item.name, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(item, tmp / item.name)
-            
-            ensure_clean_dir(dest_dir)
-            shutil.copytree(tmp, dest_dir, dirs_exist_ok=True)
-            shutil.rmtree(tmp)
+            tmp = Path(tempfile.mkdtemp(prefix="ghrs_subdir_"))
+            try:
+                for item in src.iterdir():
+                    if item.is_dir():
+                        shutil.copytree(item, tmp / item.name, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(item, tmp / item.name)
+                
+                ensure_clean_dir(dest_dir)
+                shutil.copytree(tmp, dest_dir, dirs_exist_ok=True)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
 
 
 # Sync Strategies
@@ -449,7 +469,7 @@ class ReleaseSyncStrategy(SyncStrategy):
                         break
             
             if not dl_url:
-                dl_url = release.get("zipball_url") or release.get("tarball_url")
+                dl_url = release.get("tarball_url") or release.get("zipball_url")
             
             # Download and extract
             tmp = Path(tempfile.mkdtemp(prefix=f"modsync_{module.name}_"))
