@@ -27,6 +27,7 @@ Version: 1.0.0
 
 # Standard library imports
 from __future__ import annotations
+import concurrent.futures
 import json
 import logging
 import os
@@ -55,6 +56,8 @@ class SyncConfig:
     ROOT = Path(__file__).resolve().parent
     CONFIG_FILE = "modules.json"
     DEFAULT_DEST = "modules"
+    MAX_WORKERS = int(os.environ.get("GHRS_MAX_WORKERS", "4"))
+    HTTP_TIMEOUT = int(os.environ.get("GHRS_HTTP_TIMEOUT", "20"))
     
     # GitHub API
     GITHUB_API = "https://api.github.com"
@@ -65,6 +68,8 @@ class SyncConfig:
     
     # Defaults
     DEFAULT_MODULE_DIR = "."
+    RETRY_ATTEMPTS = int(os.environ.get("GHRS_RETRY_ATTEMPTS", "3"))
+    RETRY_BACKOFF_SECONDS = int(os.environ.get("GHRS_RETRY_BACKOFF_SECONDS", "1"))
     
     # Exit codes
     EXIT_CODE_SUCCESS = 0
@@ -254,20 +259,48 @@ class GitHubDownloader:
     
     def __init__(self, token: Optional[str] = None):
         self.token = token
+
+    def _maybe_handle_rate_limit(self, err: HTTPError) -> bool:
+        """Check for GitHub rate limit response and back off once."""
+        remaining = err.headers.get("X-RateLimit-Remaining") if err.headers else None
+        reset = err.headers.get("X-RateLimit-Reset") if err.headers else None
+        if err.code == 403 and remaining == "0":
+            wait = 3
+            if reset and reset.isdigit():
+                wait = max(1, min(30, int(reset) - int(time.time())))
+            logger.warning(f"GitHub rate limit reached; retrying in {wait}s")
+            time.sleep(wait)
+            return True
+        return False
     
     def download(self, url: str, dest: Path) -> None:
         """Download a file from URL to destination."""
-        headers = {"User-Agent": "ghrs"}
+        headers = {
+            "User-Agent": "ghrs",
+            "Accept-Encoding": "gzip",
+        }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         
         req = Request(url, headers=headers)
-        try:
-            with urlopen(req) as response, open(dest, "wb") as f:
-                shutil.copyfileobj(response, f)
-            logger.debug(f"Downloaded: {url}")
-        except (HTTPError, URLError) as e:
-            raise DownloadError(f"Download failed: {url}\n{e}")
+        for attempt in range(SyncConfig.RETRY_ATTEMPTS):
+            try:
+                with urlopen(req, timeout=SyncConfig.HTTP_TIMEOUT) as response, open(dest, "wb") as f:
+                    shutil.copyfileobj(response, f)
+                logger.debug(f"Downloaded: {url}")
+                return
+            except HTTPError as e:
+                if self._maybe_handle_rate_limit(e):
+                    continue
+                if attempt < SyncConfig.RETRY_ATTEMPTS - 1:
+                    time.sleep(SyncConfig.RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise DownloadError(f"Download failed: {url}\n{e}")
+            except URLError as e:
+                if attempt < SyncConfig.RETRY_ATTEMPTS - 1:
+                    time.sleep(SyncConfig.RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise DownloadError(f"Download failed: {url}\n{e}")
     
     def get_release(self, repo: str, tag: Optional[str] = None) -> Dict[str, Any]:
         """Get release information from GitHub API."""
@@ -278,17 +311,29 @@ class GitHubDownloader:
         
         headers = {
             "User-Agent": "ghrs",
-            "Accept": "application/vnd.github+json"
+            "Accept": "application/vnd.github+json",
+            "Accept-Encoding": "gzip",
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         
         req = Request(url, headers=headers)
-        try:
-            with urlopen(req) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError) as e:
-            raise DownloadError(f"Failed to get release: {url}\n{e}")
+        for attempt in range(SyncConfig.RETRY_ATTEMPTS):
+            try:
+                with urlopen(req, timeout=SyncConfig.HTTP_TIMEOUT) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as e:
+                if self._maybe_handle_rate_limit(e):
+                    continue
+                if attempt < SyncConfig.RETRY_ATTEMPTS - 1:
+                    time.sleep(SyncConfig.RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise DownloadError(f"Failed to get release: {url}\n{e}")
+            except URLError as e:
+                if attempt < SyncConfig.RETRY_ATTEMPTS - 1:
+                    time.sleep(SyncConfig.RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise DownloadError(f"Failed to get release: {url}\n{e}")
 
 
 # Extractor
@@ -299,14 +344,29 @@ class ArchiveExtractor:
     def extract(archive_path: Path, dest_dir: Path, subdir: Optional[str] = None) -> None:
         """Extract archive to destination directory."""
         ensure_clean_dir(dest_dir)
-        
+
+        def _is_within(base: Path, target: Path) -> bool:
+            try:
+                target.relative_to(base)
+                return True
+            except ValueError:
+                return False
+
         try:
             if archive_path.suffix == ".zip":
                 with zipfile.ZipFile(archive_path) as z:
+                    for member in z.infolist():
+                        target = (dest_dir / member.filename).resolve()
+                        if not _is_within(dest_dir.resolve(), target):
+                            raise ExtractionError("Unsafe path in zip archive")
                     z.extractall(dest_dir)
             else:
                 mode = "r:gz" if archive_path.suffixes[-1] in (".gz", ".tgz") else "r"
                 with tarfile.open(archive_path, mode) as t:
+                    for member in t.getmembers():
+                        target = (dest_dir / member.name).resolve()
+                        if not _is_within(dest_dir.resolve(), target):
+                            raise ExtractionError("Unsafe path in tar archive")
                     t.extractall(dest_dir)
         except (zipfile.BadZipFile, tarfile.TarError) as e:
             raise ExtractionError(f"Failed to extract archive: {e}")
@@ -429,9 +489,15 @@ class ConfigParser:
         
         try:
             with open(config_path) as f:
-                return json.load(f)
+                cfg = json.load(f)
         except json.JSONDecodeError as e:
             raise ConfigurationError(f"Invalid JSON in config: {e}")
+
+        modules = cfg.get("modules", [])
+        if not isinstance(modules, list) or not modules:
+            raise ConfigurationError("Config 'modules' must be a non-empty list")
+
+        return cfg
 
 
 # Main Application
@@ -463,27 +529,44 @@ class ModuleSyncApplication:
                 "release": ReleaseSyncStrategy(downloader),
             }
             
-            # Sync each module
+            # Sync each module (parallel)
             results: List[SyncResult] = []
-            for entry in config.get("modules", []):
-                module = ConfigParser.parse_module(entry, default_org)
-                strategy = strategies.get(module.mode.lower())
+            modules = config.get("modules", [])
+            max_workers = min(SyncConfig.MAX_WORKERS, max(1, len(modules)))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for entry in modules:
+                    module = ConfigParser.parse_module(entry, default_org)
+                    strategy = strategies.get(module.mode.lower())
 
-                if not strategy:
-                    logger.error(
-                        f"Unsupported mode '{module.mode}' for module '{module.name}'. "
-                        "Only 'release' is allowed."
-                    )
-                    results.append(
-                        SyncResult(module.name, "unknown", module.mode, False, "Invalid mode (release-only)")
-                    )
-                    continue
+                    if not strategy:
+                        logger.error(
+                            f"Unsupported mode '{module.mode}' for module '{module.name}'. "
+                            "Only 'release' is allowed."
+                        )
+                        results.append(
+                            SyncResult(module.name, "unknown", module.mode, False, "Invalid mode (release-only)")
+                        )
+                        continue
 
-                results.append(strategy.sync(module, dest_root))
+                    futures.append((module, executor.submit(strategy.sync, module, dest_root)))
+
+                for module, future in futures:
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        logger.error(f"✗ Failed to sync {module.name}: {e}")
+                        results.append(SyncResult(module.name, "unknown", module.mode, False, str(e)))
             
             # Summary
             successful = sum(1 for r in results if r.success)
             failed = len(results) - successful
+
+            if failed:
+                logger.error("Failed modules:")
+                for r in results:
+                    if not r.success:
+                        logger.error(f"- {r.name} (mode={r.mode}, version={r.version}): {r.error}")
             
             logger.info(f"\n{'='*60}")
             logger.info(f"✓ Sync complete: {successful} successful, {failed} failed")

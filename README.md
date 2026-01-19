@@ -11,6 +11,9 @@ A professional tool for syncing GitHub repositories (particularly Terraform modu
 - **Version Tracking**: Automatic version detection with `@version` suffix (e.g., `module@v1.0.0`)
 - **Release-Only Sync**: Always pulls published releases (latest by default) for deterministic builds
 - **Automated Cleanup**: Keeps only essential Terraform files (configurable)
+- **Parallel Sync**: Sync multiple modules concurrently (bounded worker pool)
+- **Resilient Fetch**: Built-in retries and GitHub rate-limit backoff
+- **Safe Extraction**: Guards against path traversal in archives
 - **Flexible Authentication**: GitHub App or Personal Access Token
 - **Organization Support**: Global organization setting with per-module override
 - **Smart Versioning**: Preserves all versions side-by-side for easy rollback
@@ -72,6 +75,7 @@ Or use full repository paths (no organization field needed):
 - GitHub credentials (optional, for private repos or to avoid rate limits):
   - GitHub App credentials, OR
   - Personal Access Token
+- No external Python dependencies for core features
 - Optional: `PyJWT` for GitHub App authentication (`pip install PyJWT`)
 
 ## 🔐 Authentication
@@ -186,6 +190,15 @@ Downloads from GitHub releases (latest if `tag` omitted) and unpacks the zipball
 - Reproducible builds
 
 **Note**: Omit `"tag"` to automatically sync the latest release.
+
+### Runtime Tuning (env vars)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GHRS_MAX_WORKERS` | `4` | Max parallel module sync workers |
+| `GHRS_HTTP_TIMEOUT` | `20` | Seconds for network timeouts |
+| `GHRS_RETRY_ATTEMPTS` | `3` | Total retry attempts for API/downloads |
+| `GHRS_RETRY_BACKOFF_SECONDS` | `1` | Base backoff between retries |
 
 ## 📦 Output Structure
 
@@ -313,11 +326,11 @@ echo $GITHUB_TOKEN
 - Configure authentication (GitHub App or PAT)
 - Authenticated requests have 5,000/hour limit
 
-**Git Clone Failed**
+**Download/Release Fetch Failed**
 
-- Ensure Git is installed: `git --version`
 - Check network connectivity to GitHub
-- Verify repository URL and access permissions
+- Ensure authentication is set to avoid rate limits
+- Verify the release tag/asset exists
 
 **Wrong Files in Module**
 
@@ -348,10 +361,10 @@ You're using a simple module name without an organization field. Either:
 
 GHRS is designed for efficiency:
 
-- **Fast Cloning**: Uses `--depth 1` for shallow clones
-- **Minimal Downloads**: Only fetches what's needed
-- **Parallel Safe**: Can sync multiple modules (run multiple instances)
-- **Incremental**: Only downloads new versions on subsequent runs
+- **Parallel Downloads**: Bounded worker pool for multiple modules
+- **Minimal Downloads**: Pulls release archives only
+- **Retry & Backoff**: Built-in retries with rate-limit handling
+- **Incremental**: Writes versioned module directories side-by-side
 
 ### Typical Sync Times
 
