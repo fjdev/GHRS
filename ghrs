@@ -28,6 +28,7 @@ Version: 1.0.0
 # Standard library imports
 from __future__ import annotations
 import concurrent.futures
+import gzip
 import json
 import logging
 import os
@@ -199,7 +200,8 @@ class GitHubAppAuthProvider(GitHubAuthProvider):
         req = Request(url, headers=headers, method="POST")
         try:
             with urlopen(req) as r:
-                data = json.loads(r.read().decode("utf-8"))
+                response_data = decompress_response(r.read())
+                data = json.loads(response_data.decode("utf-8"))
                 return data.get("token")
         except (HTTPError, URLError) as e:
             raise AuthenticationError(f"Failed to get GitHub App token: {e}")
@@ -240,6 +242,14 @@ def ensure_clean_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def decompress_response(data: bytes) -> bytes:
+    """Decompress gzip-encoded response data if needed."""
+    # Check for gzip magic number (0x1f 0x8b)
+    if len(data) >= 2 and data[0] == 0x1f and data[1] == 0x8b:
+        return gzip.decompress(data)
+    return data
 
 
 def cleanup_unwanted_files(dest_dir: Path) -> None:
@@ -321,7 +331,8 @@ class GitHubDownloader:
         for attempt in range(SyncConfig.RETRY_ATTEMPTS):
             try:
                 with urlopen(req, timeout=SyncConfig.HTTP_TIMEOUT) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                    response_data = decompress_response(response.read())
+                    return json.loads(response_data.decode("utf-8"))
             except HTTPError as e:
                 if self._maybe_handle_rate_limit(e):
                     continue
