@@ -7,7 +7,7 @@ A professional tool for syncing GitHub repositories (particularly Terraform modu
 with version tracking and automated cleanup.
 
 Features:
-- Multiple sync modes (release, mirror)
+- Release-based syncing (latest or tagged)
 - Version tracking with @version suffix
 - Automatic file cleanup (keeps only essential TF files)
 - GitHub App and PAT authentication
@@ -31,12 +31,11 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from urllib.request import Request, urlopen
@@ -65,7 +64,6 @@ class SyncConfig:
     ALLOWED_FILES = {"main.tf", "outputs.tf", "README.md", "terraform.tf", "variables.tf"}
     
     # Defaults
-    DEFAULT_MODE = "mirror"
     DEFAULT_MODULE_DIR = "."
     
     # Exit codes
@@ -123,8 +121,7 @@ class ModuleConfig:
     """Configuration for a single module."""
     name: str
     repo: str
-    mode: str = SyncConfig.DEFAULT_MODE
-    ref: Optional[str] = None
+    mode: str = "release"
     tag: Optional[str] = None
     asset_name: Optional[str] = None
     module_dir: str = SyncConfig.DEFAULT_MODULE_DIR
@@ -231,23 +228,6 @@ class AuthenticationManager:
         
         logger.warning("No authentication configured - API rate limits may apply")
         return None
-
-
-# Utility Functions
-def run_command(cmd: List[str], cwd: Optional[Path] = None) -> str:
-    """Run a shell command and return output."""
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
-        )
-        return result.stdout
-    except subprocess.CalledProcessError as e:
-        raise GitOperationError(f"Command failed: {' '.join(cmd)}\n{e.stderr}")
 
 
 def ensure_clean_dir(path: Path) -> None:
@@ -415,65 +395,6 @@ class ReleaseSyncStrategy(SyncStrategy):
         except Exception as e:
             logger.error(f"✗ Failed to sync {module.name}: {e}")
             return SyncResult(module.name, "unknown", "release", False, str(e))
-
-
-class MirrorSyncStrategy(SyncStrategy):
-    """Sync by cloning Git repository."""
-    
-    def sync(self, module: ModuleConfig, dest_root: Path) -> SyncResult:
-        """Sync module by cloning from Git."""
-        try:
-            logger.info(f"Syncing {module.name} from Git...")
-            
-            tmp = Path(tempfile.mkdtemp(prefix=f"modmirror_{module.name}_"))
-            try:
-                # Clone repository
-                url = f"{SyncConfig.GITHUB_URL}/{module.repo}.git"
-                clone_cmd = ["git", "clone", "--depth", "1", url, str(tmp)]
-                if module.ref:
-                    clone_cmd = ["git", "clone", "--depth", "1", "--branch", module.ref, url, str(tmp)]
-                
-                run_command(clone_cmd)
-                
-                # Get version
-                version = run_command(["git", "describe", "--tags", "--always"], cwd=tmp).strip() or "latest"
-                
-                # Copy module
-                versioned_name = f"{module.name}@{version}"
-                dest = dest_root / versioned_name
-                
-                self._copy_module_src(tmp, dest, module.module_dir)
-                
-                if (dest / ".git").exists():
-                    shutil.rmtree(dest / ".git")
-                
-                cleanup_unwanted_files(dest)
-                
-                logger.info(f"✓ Synced: {module.name} ({version})")
-                return SyncResult(module.name, version, "mirror", True)
-                
-            finally:
-                shutil.rmtree(tmp, ignore_errors=True)
-                
-        except Exception as e:
-            logger.error(f"✗ Failed to sync {module.name}: {e}")
-            return SyncResult(module.name, "unknown", "mirror", False, str(e))
-    
-    def _copy_module_src(self, src_dir: Path, dest_dir: Path, module_dir: str) -> None:
-        """Copy module source files."""
-        base = src_dir if module_dir == "." else (src_dir / module_dir)
-        if not base.exists():
-            raise ExtractionError(f"Module dir '{module_dir}' not found in repo")
-        
-        ensure_clean_dir(dest_dir)
-        for item in base.iterdir():
-            target = dest_dir / item.name
-            if item.is_dir():
-                shutil.copytree(item, target, dirs_exist_ok=True)
-            else:
-                shutil.copy2(item, target)
-
-
 # Configuration Parser
 class ConfigParser:
     """Parse module configuration."""
@@ -495,8 +416,10 @@ class ConfigParser:
             name = repo.split("/")[-1]
             return ModuleConfig(name=name, repo=repo)
         else:
-            # Dict format
-            return ModuleConfig(**entry)
+            # Dict format; ignore legacy 'ref' field
+            cfg = dict(entry)
+            cfg.pop("ref", None)
+            return ModuleConfig(**cfg)
     
     @staticmethod
     def load_config(config_path: Path) -> Dict[str, Any]:
@@ -538,7 +461,6 @@ class ModuleSyncApplication:
             downloader = GitHubDownloader(token)
             strategies = {
                 "release": ReleaseSyncStrategy(downloader),
-                "mirror": MirrorSyncStrategy(),
             }
             
             # Sync each module
@@ -546,14 +468,18 @@ class ModuleSyncApplication:
             for entry in config.get("modules", []):
                 module = ConfigParser.parse_module(entry, default_org)
                 strategy = strategies.get(module.mode.lower())
-                
+
                 if not strategy:
-                    logger.error(f"Unknown mode '{module.mode}' for module '{module.name}'")
-                    results.append(SyncResult(module.name, "unknown", module.mode, False, "Invalid mode"))
+                    logger.error(
+                        f"Unsupported mode '{module.mode}' for module '{module.name}'. "
+                        "Only 'release' is allowed."
+                    )
+                    results.append(
+                        SyncResult(module.name, "unknown", module.mode, False, "Invalid mode (release-only)")
+                    )
                     continue
-                
-                result = strategy.sync(module, dest_root)
-                results.append(result)
+
+                results.append(strategy.sync(module, dest_root))
             
             # Summary
             successful = sum(1 for r in results if r.success)

@@ -9,7 +9,7 @@ A professional tool for syncing GitHub repositories (particularly Terraform modu
 ## ✨ Features
 
 - **Version Tracking**: Automatic version detection with `@version` suffix (e.g., `module@v1.0.0`)
-- **Multiple Sync Modes**: Release-based or Git mirror syncing
+- **Release-Only Sync**: Always pulls published releases (latest by default) for deterministic builds
 - **Automated Cleanup**: Keeps only essential Terraform files (configurable)
 - **Flexible Authentication**: GitHub App or Personal Access Token
 - **Organization Support**: Global organization setting with per-module override
@@ -34,7 +34,7 @@ chmod +x ghrs
 ### Basic Usage
 
 ```bash
-# Sync modules from configuration
+# Sync modules from latest release (default)
 ./ghrs
 
 # That's it! The tool reads modules.json and syncs everything
@@ -149,8 +149,7 @@ Resolves to: `{organization}/module-name`
 {
   "name": "module-name",
   "repo": "owner/repository",
-  "mode": "mirror",
-  "ref": "main",
+  "mode": "release",
   "module_dir": "."
 }
 ```
@@ -159,37 +158,16 @@ Resolves to: `{organization}/module-name`
 |-------|------|---------|-------------|
 | `name` | string | (required) | Local name for the module |
 | `repo` | string | (required) | GitHub repository (`owner/repo`) |
-| `mode` | string | `"mirror"` | Sync mode: `"mirror"` or `"release"` |
-| `ref` | string | `null` | Git branch/tag (mirror mode only) |
+| `mode` | string | `"release"` | Sync mode (release-only) |
 | `tag` | string | `null` | Release tag (release mode, `null` = latest) |
 | `asset_name` | string | `null` | Specific release asset name |
 | `module_dir` | string | `"."` | Subdirectory within repo to extract |
 
-## 🔧 Sync Modes
+## 🔧 Sync Mode
 
-### Mirror Mode (Default)
+### Release Mode (Only)
 
-Clones the repository and extracts the latest commit:
-
-```json
-{
-  "name": "my-module",
-  "repo": "myorg/terraform-module",
-  "mode": "mirror",
-  "ref": "main"
-}
-```
-
-**Version detection**: Uses `git describe --tags --always`
-
-**Use cases**:
-- Development/testing with latest code
-- Modules without formal releases
-- Custom branches or commits
-
-### Release Mode
-
-Downloads from GitHub releases:
+Downloads from GitHub releases (latest if `tag` omitted) and unpacks the zipball into the local destination:
 
 ```json
 {
@@ -200,7 +178,7 @@ Downloads from GitHub releases:
 }
 ```
 
-**Version detection**: Uses release tag name
+**Version detection**: Uses release tag name (or `latest` when unspecified)
 
 **Use cases**:
 - Production deployments
@@ -275,8 +253,7 @@ module "resource_group" {
     "anotherorg/external-module",
     {
       "name": "custom",
-      "repo": "thirdorg/special-module",
-      "ref": "develop"
+      "repo": "thirdorg/special-module"
     }
   ]
 }
@@ -421,33 +398,11 @@ modules/
 }
 ```
 
-### Example 3: Mixed Modes
-
-```json
-{
-  "organization": "myorg",
-  "modules": [
-    {
-      "name": "prod-module",
-      "repo": "myorg/terraform-module",
-      "mode": "release",
-      "tag": "v1.0.0"
-    },
-    {
-      "name": "dev-module",
-      "repo": "myorg/terraform-module",
-      "mode": "mirror",
-      "ref": "develop"
-    }
-  ]
-}
-```
-
 ## 🏗️ Architecture
 
 GHRS follows professional software engineering patterns:
 
-- **Strategy Pattern**: Pluggable sync strategies (Release, Mirror)
+- **Strategy Pattern**: Pluggable sync strategies (Release-only)
 - **Provider Pattern**: Multiple authentication providers
 - **Dataclasses**: Type-safe configuration and results
 - **ABC Classes**: Clean interfaces and extensibility
