@@ -1,0 +1,6 @@
+{
+  "organization": "fjdev",
+  "modules": [
+    "terraform-azurerm-fjdev-res-resource-group"
+  ]
+}

@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""
+GitHub Repository Sync (GHRS)
+==============================
+
+A professional tool for syncing GitHub repositories (particularly Terraform modules)
+with version tracking and automated cleanup.
+
+Features:
+- Multiple sync modes (release, mirror)
+- Version tracking with @version suffix
+- Automatic file cleanup (keeps only essential TF files)
+- GitHub App and PAT authentication
+- Configurable organization defaults
+- Robust error handling and logging
+
+Requirements:
+- Python 3.7+
+- Git CLI
+- GitHub credentials (App or PAT)
+- PyJWT (optional, for GitHub App authentication)
+
+Author: fjdev
+License: MIT
+Version: 1.0.0
+"""
+
+# Standard library imports
+from __future__ import annotations
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+import zipfile
+import tarfile
+
+
+__version__ = "1.0.0"
+__author__ = "fjdev"
+
+
+# Configuration
+class SyncConfig:
+    """Configuration constants for GHRS."""
+    # Paths
+    ROOT = Path(__file__).resolve().parent
+    CONFIG_FILE = "modules.json"
+    DEFAULT_DEST = "modules"
+    
+    # GitHub API
+    GITHUB_API = "https://api.github.com"
+    GITHUB_URL = "https://github.com"
+    
+    # Allowed files (all others will be removed)
+    ALLOWED_FILES = {"main.tf", "outputs.tf", "README.md", "terraform.tf", "variables.tf"}
+    
+    # Defaults
+    DEFAULT_MODE = "mirror"
+    DEFAULT_MODULE_DIR = "."
+    
+    # Exit codes
+    EXIT_CODE_SUCCESS = 0
+    EXIT_CODE_ERROR = 1
+    
+    # Logging
+    LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+    LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format=SyncConfig.LOG_FORMAT,
+    datefmt=SyncConfig.LOG_DATE_FORMAT
+)
+logger = logging.getLogger(__name__)
+
+
+# Custom Exceptions
+class SyncError(Exception):
+    """Base exception for sync errors."""
+    pass
+
+
+class AuthenticationError(SyncError):
+    """Raised when authentication fails."""
+    pass
+
+
+class DownloadError(SyncError):
+    """Raised when download operations fail."""
+    pass
+
+
+class ExtractionError(SyncError):
+    """Raised when extraction operations fail."""
+    pass
+
+
+class ConfigurationError(SyncError):
+    """Raised when configuration is invalid."""
+    pass
+
+
+class GitOperationError(SyncError):
+    """Raised when git operations fail."""
+    pass
+
+
+# Data Models
+@dataclass
+class ModuleConfig:
+    """Configuration for a single module."""
+    name: str
+    repo: str
+    mode: str = SyncConfig.DEFAULT_MODE
+    ref: Optional[str] = None
+    tag: Optional[str] = None
+    asset_name: Optional[str] = None
+    module_dir: str = SyncConfig.DEFAULT_MODULE_DIR
+
+
+@dataclass
+class SyncResult:
+    """Result of a sync operation."""
+    name: str
+    version: str
+    mode: str
+    success: bool
+    error: Optional[str] = None
+
+
+# Authentication
+class GitHubAuthProvider(ABC):
+    """Abstract base class for GitHub authentication providers."""
+    
+    @abstractmethod
+    def get_token(self) -> Optional[str]:
+        """Get authentication token."""
+        pass
+
+
+class GitHubAppAuthProvider(GitHubAuthProvider):
+    """GitHub App authentication provider."""
+    
+    def get_token(self) -> Optional[str]:
+        """Generate GitHub App installation access token."""
+        app_id = os.environ.get("GITHUB_APP_ID")
+        install_id = os.environ.get("GITHUB_APP_INSTALLATION_ID")
+        private_key_path = os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH")
+        private_key_env = os.environ.get("GITHUB_APP_PRIVATE_KEY")
+        
+        if not all([app_id, install_id]) or not (private_key_path or private_key_env):
+            return None
+        
+        try:
+            import jwt
+        except ImportError:
+            logger.warning("PyJWT not installed. Run: pip install PyJWT")
+            return None
+        
+        # Load private key
+        if private_key_path and Path(private_key_path).exists():
+            with open(private_key_path, "r") as f:
+                private_key = f.read()
+        elif private_key_env:
+            private_key = private_key_env.replace("\\n", "\n")
+        else:
+            logger.warning("Private key not found")
+            return None
+        
+        # Generate JWT
+        now = int(time.time())
+        payload = {
+            "iat": now - 60,
+            "exp": now + (10 * 60),
+            "iss": app_id
+        }
+        jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
+        
+        # Get installation access token
+        url = f"{SyncConfig.GITHUB_API}/app/installations/{install_id}/access_tokens"
+        headers = {
+            "Authorization": f"Bearer {jwt_token}",
+            "Accept": "application/vnd.github+json"
+        }
+        req = Request(url, headers=headers, method="POST")
+        try:
+            with urlopen(req) as r:
+                data = json.loads(r.read().decode("utf-8"))
+                return data.get("token")
+        except (HTTPError, URLError) as e:
+            raise AuthenticationError(f"Failed to get GitHub App token: {e}")
+
+
+class PersonalAccessTokenAuthProvider(GitHubAuthProvider):
+    """Personal Access Token authentication provider."""
+    
+    def get_token(self) -> Optional[str]:
+        """Get PAT from environment."""
+        return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+
+
+class AuthenticationManager:
+    """Manages authentication token retrieval."""
+    
+    def __init__(self):
+        self.providers: List[GitHubAuthProvider] = [
+            GitHubAppAuthProvider(),
+            PersonalAccessTokenAuthProvider(),
+        ]
+    
+    def get_token(self) -> Optional[str]:
+        """Try each authentication provider in order."""
+        for provider in self.providers:
+            token = provider.get_token()
+            if token:
+                provider_name = provider.__class__.__name__.replace("AuthProvider", "")
+                logger.info(f"Using {provider_name} authentication")
+                return token
+        
+        logger.warning("No authentication configured - API rate limits may apply")
+        return None
+
+
+# Utility Functions
+def run_command(cmd: List[str], cwd: Optional[Path] = None) -> str:
+    """Run a shell command and return output."""
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        raise GitOperationError(f"Command failed: {' '.join(cmd)}\n{e.stderr}")
+
+
+def ensure_clean_dir(path: Path) -> None:
+    """Ensure directory exists and is empty."""
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def cleanup_unwanted_files(dest_dir: Path) -> None:
+    """Remove all files except the allowed ones."""
+    for item in dest_dir.iterdir():
+        if item.is_file() and item.name not in SyncConfig.ALLOWED_FILES:
+            item.unlink()
+            logger.debug(f"Removed: {item.name}")
+        elif item.is_dir():
+            shutil.rmtree(item)
+            logger.debug(f"Removed directory: {item.name}")
+
+
+# Downloader
+class GitHubDownloader:
+    """Handles downloading from GitHub."""
+    
+    def __init__(self, token: Optional[str] = None):
+        self.token = token
+    
+    def download(self, url: str, dest: Path) -> None:
+        """Download a file from URL to destination."""
+        headers = {"User-Agent": "ghrs"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        
+        req = Request(url, headers=headers)
+        try:
+            with urlopen(req) as response, open(dest, "wb") as f:
+                shutil.copyfileobj(response, f)
+            logger.debug(f"Downloaded: {url}")
+        except (HTTPError, URLError) as e:
+            raise DownloadError(f"Download failed: {url}\n{e}")
+    
+    def get_release(self, repo: str, tag: Optional[str] = None) -> Dict[str, Any]:
+        """Get release information from GitHub API."""
+        if tag:
+            url = f"{SyncConfig.GITHUB_API}/repos/{repo}/releases/tags/{tag}"
+        else:
+            url = f"{SyncConfig.GITHUB_API}/repos/{repo}/releases/latest"
+        
+        headers = {
+            "User-Agent": "ghrs",
+            "Accept": "application/vnd.github+json"
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        
+        req = Request(url, headers=headers)
+        try:
+            with urlopen(req) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError) as e:
+            raise DownloadError(f"Failed to get release: {url}\n{e}")
+
+
+# Extractor
+class ArchiveExtractor:
+    """Handles archive extraction."""
+    
+    @staticmethod
+    def extract(archive_path: Path, dest_dir: Path, subdir: Optional[str] = None) -> None:
+        """Extract archive to destination directory."""
+        ensure_clean_dir(dest_dir)
+        
+        try:
+            if archive_path.suffix == ".zip":
+                with zipfile.ZipFile(archive_path) as z:
+                    z.extractall(dest_dir)
+            else:
+                mode = "r:gz" if archive_path.suffixes[-1] in (".gz", ".tgz") else "r"
+                with tarfile.open(archive_path, mode) as t:
+                    t.extractall(dest_dir)
+        except (zipfile.BadZipFile, tarfile.TarError) as e:
+            raise ExtractionError(f"Failed to extract archive: {e}")
+        
+        if subdir:
+            roots = [p for p in dest_dir.iterdir() if p.is_dir()]
+            base = roots[0] if roots else dest_dir
+            src = (base / subdir).resolve()
+            
+            if not src.exists():
+                raise ExtractionError(f"Subdir '{subdir}' not found in archive")
+            
+            tmp = dest_dir / "__tmp__"
+            ensure_clean_dir(tmp)
+            
+            for item in src.iterdir():
+                if item.is_dir():
+                    shutil.copytree(item, tmp / item.name, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, tmp / item.name)
+            
+            ensure_clean_dir(dest_dir)
+            shutil.copytree(tmp, dest_dir, dirs_exist_ok=True)
+            shutil.rmtree(tmp)
+
+
+# Sync Strategies
+class SyncStrategy(ABC):
+    """Abstract base class for sync strategies."""
+    
+    @abstractmethod
+    def sync(self, module: ModuleConfig, dest_root: Path) -> SyncResult:
+        """Sync a module."""
+        pass
+
+
+class ReleaseSyncStrategy(SyncStrategy):
+    """Sync from GitHub releases."""
+    
+    def __init__(self, downloader: GitHubDownloader):
+        self.downloader = downloader
+    
+    def sync(self, module: ModuleConfig, dest_root: Path) -> SyncResult:
+        """Sync module from GitHub release."""
+        try:
+            logger.info(f"Syncing {module.name} from release...")
+            
+            # Get release info
+            release = self.downloader.get_release(module.repo, module.tag)
+            version = release.get("tag_name") or release.get("tag") or "latest"
+            
+            # Find download URL
+            dl_url = None
+            if module.asset_name and release.get("assets"):
+                for asset in release["assets"]:
+                    if asset.get("name") == module.asset_name:
+                        dl_url = asset.get("browser_download_url")
+                        break
+            
+            if not dl_url:
+                dl_url = release.get("zipball_url") or release.get("tarball_url")
+            
+            # Download and extract
+            tmp = Path(tempfile.mkdtemp(prefix=f"modsync_{module.name}_"))
+            try:
+                archive = tmp / (module.asset_name or "source.zip")
+                self.downloader.download(dl_url, archive)
+                
+                versioned_name = f"{module.name}@{version}"
+                dest = dest_root / versioned_name
+                
+                ArchiveExtractor.extract(
+                    archive,
+                    dest,
+                    module.module_dir if module.module_dir != "." else None
+                )
+                
+                cleanup_unwanted_files(dest)
+                
+                logger.info(f"✓ Synced: {module.name} ({version})")
+                return SyncResult(module.name, version, "release", True)
+                
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+                
+        except Exception as e:
+            logger.error(f"✗ Failed to sync {module.name}: {e}")
+            return SyncResult(module.name, "unknown", "release", False, str(e))
+
+
+class MirrorSyncStrategy(SyncStrategy):
+    """Sync by cloning Git repository."""
+    
+    def sync(self, module: ModuleConfig, dest_root: Path) -> SyncResult:
+        """Sync module by cloning from Git."""
+        try:
+            logger.info(f"Syncing {module.name} from Git...")
+            
+            tmp = Path(tempfile.mkdtemp(prefix=f"modmirror_{module.name}_"))
+            try:
+                # Clone repository
+                url = f"{SyncConfig.GITHUB_URL}/{module.repo}.git"
+                clone_cmd = ["git", "clone", "--depth", "1", url, str(tmp)]
+                if module.ref:
+                    clone_cmd = ["git", "clone", "--depth", "1", "--branch", module.ref, url, str(tmp)]
+                
+                run_command(clone_cmd)
+                
+                # Get version
+                version = run_command(["git", "describe", "--tags", "--always"], cwd=tmp).strip() or "latest"
+                
+                # Copy module
+                versioned_name = f"{module.name}@{version}"
+                dest = dest_root / versioned_name
+                
+                self._copy_module_src(tmp, dest, module.module_dir)
+                
+                if (dest / ".git").exists():
+                    shutil.rmtree(dest / ".git")
+                
+                cleanup_unwanted_files(dest)
+                
+                logger.info(f"✓ Synced: {module.name} ({version})")
+                return SyncResult(module.name, version, "mirror", True)
+                
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+                
+        except Exception as e:
+            logger.error(f"✗ Failed to sync {module.name}: {e}")
+            return SyncResult(module.name, "unknown", "mirror", False, str(e))
+    
+    def _copy_module_src(self, src_dir: Path, dest_dir: Path, module_dir: str) -> None:
+        """Copy module source files."""
+        base = src_dir if module_dir == "." else (src_dir / module_dir)
+        if not base.exists():
+            raise ExtractionError(f"Module dir '{module_dir}' not found in repo")
+        
+        ensure_clean_dir(dest_dir)
+        for item in base.iterdir():
+            target = dest_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
+
+
+# Configuration Parser
+class ConfigParser:
+    """Parse module configuration."""
+    
+    @staticmethod
+    def parse_module(entry: str | dict, default_org: Optional[str]) -> ModuleConfig:
+        """Parse module entry from string or dict format."""
+        if isinstance(entry, str):
+            # Format must be "owner/repo-name"
+            if "/" not in entry:
+                if not default_org:
+                    raise ConfigurationError(
+                        f"Module '{entry}' missing organization. "
+                        "Either specify 'organization' in config or use 'owner/repo' format."
+                    )
+                repo = f"{default_org}/{entry}"
+            else:
+                repo = entry
+            name = repo.split("/")[-1]
+            return ModuleConfig(name=name, repo=repo)
+        else:
+            # Dict format
+            return ModuleConfig(**entry)
+    
+    @staticmethod
+    def load_config(config_path: Path) -> Dict[str, Any]:
+        """Load configuration from JSON file."""
+        if not config_path.exists():
+            raise ConfigurationError(f"Config not found: {config_path}")
+        
+        try:
+            with open(config_path) as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            raise ConfigurationError(f"Invalid JSON in config: {e}")
+
+
+# Main Application
+class ModuleSyncApplication:
+    """Main module sync application."""
+    
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.auth_manager = AuthenticationManager()
+    
+    def run(self) -> int:
+        """Run the sync application."""
+        try:
+            # Load configuration
+            config = ConfigParser.load_config(self.config_path)
+            
+            # Setup paths
+            dest_root = SyncConfig.ROOT / config.get("destination_root", SyncConfig.DEFAULT_DEST)
+            dest_root.mkdir(parents=True, exist_ok=True)
+            
+            default_org = config.get("organization")
+            
+            # Get authentication
+            token = self.auth_manager.get_token()
+            
+            # Initialize sync strategies
+            downloader = GitHubDownloader(token)
+            strategies = {
+                "release": ReleaseSyncStrategy(downloader),
+                "mirror": MirrorSyncStrategy(),
+            }
+            
+            # Sync each module
+            results: List[SyncResult] = []
+            for entry in config.get("modules", []):
+                module = ConfigParser.parse_module(entry, default_org)
+                strategy = strategies.get(module.mode.lower())
+                
+                if not strategy:
+                    logger.error(f"Unknown mode '{module.mode}' for module '{module.name}'")
+                    results.append(SyncResult(module.name, "unknown", module.mode, False, "Invalid mode"))
+                    continue
+                
+                result = strategy.sync(module, dest_root)
+                results.append(result)
+            
+            # Summary
+            successful = sum(1 for r in results if r.success)
+            failed = len(results) - successful
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"✓ Sync complete: {successful} successful, {failed} failed")
+            logger.info(f"  Modules synced to: {dest_root}")
+            logger.info(f"{'='*60}")
+            
+            return SyncConfig.EXIT_CODE_SUCCESS if failed == 0 else SyncConfig.EXIT_CODE_ERROR
+            
+        except ConfigurationError as e:
+            logger.error(f"Configuration error: {e}")
+            return SyncConfig.EXIT_CODE_ERROR
+        except AuthenticationError as e:
+            logger.error(f"Authentication error: {e}")
+            return SyncConfig.EXIT_CODE_ERROR
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            logger.debug("", exc_info=True)
+            return SyncConfig.EXIT_CODE_ERROR
+
+
+def main() -> int:
+    """Main entry point."""
+    config_path = SyncConfig.ROOT / SyncConfig.CONFIG_FILE
+    app = ModuleSyncApplication(config_path)
+    return app.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
