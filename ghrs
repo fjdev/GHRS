@@ -29,7 +29,6 @@ Version: 1.0.0
 from __future__ import annotations
 import concurrent.futures
 import gzip
-import hashlib
 import json
 import logging
 import os
@@ -38,7 +37,6 @@ import sys
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -289,52 +287,9 @@ def save_release_notes(dest_dir: Path, release: Dict[str, Any], repo: str, modul
         logger.warning(f"Failed to save release notes: {e}")
 
 
-def calculate_sha256(file_path: Path) -> str:
-    """Calculate SHA256 hash of a file."""
-    sha256_hash = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
-
-
-def save_metadata(dest_dir: Path, archive_path: Path, release: Dict[str, Any], 
-                  repo: str, module_name: str) -> None:
-    """Save metadata about the synced module."""
-    try:
-        metadata_path = dest_dir / "METADATA.json"
-        
-        # Calculate archive checksum
-        archive_sha256 = calculate_sha256(archive_path)
-        
-        # Extract metadata from release
-        tag = release.get("tag_name", "unknown")
-        html_url = release.get("html_url", "")
-        published_at = release.get("published_at", "unknown")
-        
-        # Create metadata structure
-        metadata = {
-            "module_name": module_name,
-            "version": tag,
-            "github_repo": repo,
-            "github_release_url": html_url,
-            "release_date": published_at,
-            "synced_at": datetime.now(timezone.utc).isoformat(),
-            "archive_sha256": archive_sha256,
-            "ghrs_version": __version__
-        }
-        
-        # Write metadata file
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
-        logger.debug(f"Saved metadata to {metadata_path}")
-    except Exception as e:
-        logger.warning(f"Failed to save metadata: {e}")
-
-
 def cleanup_unwanted_files(dest_dir: Path) -> None:
-    """Remove all files except the allowed ones, RELEASE_NOTES.md, and METADATA.json."""
-    allowed = SyncConfig.ALLOWED_FILES | {"RELEASE_NOTES.md", "METADATA.json"}
+    """Remove all files except the allowed ones and RELEASE_NOTES.md."""
+    allowed = SyncConfig.ALLOWED_FILES | {"RELEASE_NOTES.md"}
     for item in dest_dir.iterdir():
         if item.is_file() and item.name not in allowed:
             item.unlink()
@@ -574,7 +529,6 @@ class ReleaseSyncStrategy(SyncStrategy):
                 )
                 
                 save_release_notes(dest, release, module.repo, module.name)
-                save_metadata(dest, archive, release, module.repo, module.name)
                 cleanup_unwanted_files(dest)
                 
                 logger.info(f"✓ Synced: {module.name} ({version})")
