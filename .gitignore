@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments & dotenv
+.venv/
+.env/
+.env.local
+autoenv.zsh
+
+# Tool output
+modules/
+*.token
+*.credentials
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Personal notes
+NOTES.md
+TODO.local.md
