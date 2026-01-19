@@ -364,16 +364,27 @@ class ArchiveExtractor:
                 return False
 
         try:
-            if archive_path.suffix == ".zip":
+            # Determine archive type from extension
+            is_zip = archive_path.name.endswith(".zip")
+            is_targz = archive_path.name.endswith((".tar.gz", ".tgz"))
+            
+            if is_zip:
                 with zipfile.ZipFile(archive_path) as z:
                     for member in z.infolist():
                         target = (dest_dir / member.filename).resolve()
                         if not _is_within(dest_dir.resolve(), target):
                             raise ExtractionError("Unsafe path in zip archive")
                     z.extractall(dest_dir)
+            elif is_targz:
+                with tarfile.open(archive_path, "r:gz") as t:
+                    for member in t.getmembers():
+                        target = (dest_dir / member.name).resolve()
+                        if not _is_within(dest_dir.resolve(), target):
+                            raise ExtractionError("Unsafe path in tar archive")
+                    t.extractall(dest_dir)
             else:
-                mode = "r:gz" if archive_path.suffixes[-1] in (".gz", ".tgz") else "r"
-                with tarfile.open(archive_path, mode) as t:
+                # Assume uncompressed tar
+                with tarfile.open(archive_path, "r") as t:
                     for member in t.getmembers():
                         target = (dest_dir / member.name).resolve()
                         if not _is_within(dest_dir.resolve(), target):
@@ -443,7 +454,13 @@ class ReleaseSyncStrategy(SyncStrategy):
             # Download and extract
             tmp = Path(tempfile.mkdtemp(prefix=f"modsync_{module.name}_"))
             try:
-                archive = tmp / (module.asset_name or "source.zip")
+                # Determine archive filename and extension based on URL
+                if module.asset_name:
+                    archive = tmp / module.asset_name
+                elif "tarball" in dl_url:
+                    archive = tmp / "source.tar.gz"
+                else:
+                    archive = tmp / "source.zip"
                 self.downloader.download(dl_url, archive)
                 
                 versioned_name = f"{module.name}@{version}"
