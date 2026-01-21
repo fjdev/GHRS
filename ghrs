@@ -548,6 +548,11 @@ class ConfigParser:
     def parse_module(entry: str | dict, default_org: Optional[str]) -> ModuleConfig:
         """Parse module entry from string or dict format."""
         if isinstance(entry, str):
+            # Check for version suffix (e.g., "owner/repo@v1.2.0" or "module-name@v1.2.0")
+            tag = None
+            if "@" in entry:
+                entry, tag = entry.rsplit("@", 1)
+            
             # Format must be "owner/repo-name"
             if "/" not in entry:
                 if not default_org:
@@ -559,7 +564,7 @@ class ConfigParser:
             else:
                 repo = entry
             name = repo.split("/")[-1]
-            return ModuleConfig(name=name, repo=repo)
+            return ModuleConfig(name=name, repo=repo, tag=tag)
         else:
             # Dict format; ignore legacy 'ref' field
             cfg = dict(entry)

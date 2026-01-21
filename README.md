@@ -68,6 +68,18 @@ Or use full repository paths (no organization field needed):
 }
 ```
 
+Or specify versions directly with `@version` syntax:
+
+```json
+{
+  "organization": "myorg",
+  "modules": [
+    "terraform-module-name@v1.0.0",
+    "owner/another-module@v2.1.3"
+  ]
+}
+```
+
 ## 📋 Requirements
 
 - Python 3.7+
@@ -116,6 +128,7 @@ GHRS works without authentication for public repositories, but may hit GitHub AP
   "destination_root": "modules",
   "modules": [
     "simple-module-name",
+    "another-module@v1.0.0",
     {
       "name": "custom-module",
       "repo": "owner/repo",
@@ -145,7 +158,23 @@ GHRS works without authentication for public repositories, but may hit GitHub AP
 "module-name"
 ```
 
-Resolves to: `{organization}/module-name`
+Resolves to: `{organization}/module-name` (latest release)
+
+**With version:**
+
+```json
+"module-name@v1.2.0"
+```
+
+Resolves to: `{organization}/module-name` at tag `v1.2.0`
+
+**Full path with version:**
+
+```json
+"owner/repo-name@v1.2.0"
+```
+
+Resolves to: `owner/repo-name` at tag `v1.2.0`
 
 #### Full Format
 
@@ -171,8 +200,14 @@ Resolves to: `{organization}/module-name`
 
 ### Release Mode (Only)
 
-Downloads from GitHub releases (latest if `tag` omitted) and unpacks the zipball into the local destination:
+Downloads from GitHub releases (latest if version omitted) and unpacks the zipball into the local destination:
 
+**Simple syntax (recommended):**
+```json
+"myorg/terraform-module@v1.0.0"
+```
+
+**Full format (for advanced options):**
 ```json
 {
   "name": "my-module",
@@ -189,7 +224,7 @@ Downloads from GitHub releases (latest if `tag` omitted) and unpacks the zipball
 - Stable, tagged versions
 - Reproducible builds
 
-**Note**: Omit `"tag"` to automatically sync the latest release.
+**Note**: Omit version/`"tag"` to automatically sync the latest release.
 
 ### Runtime Tuning (env vars)
 
@@ -256,6 +291,20 @@ module "resource_group" {
 
 ## 🔧 Advanced Usage
 
+### Quick Examples
+
+**Multiple versions, mixed formats:**
+```json
+{
+  "organization": "myorg",
+  "modules": [
+    "simple-module@v1.0.0",
+    "another-module",
+    "external-org/special-module@v2.1.0"
+  ]
+}
+```
+
 ### Mixed Organization Sources
 
 ```json
@@ -280,6 +329,16 @@ Extract a subdirectory from a repository:
 {
   "name": "networking",
   "repo": "myorg/terraform-modules",
+  "module_dir": "modules/networking"
+}
+```
+
+Or with a specific version:
+```json
+{
+  "name": "networking",
+  "repo": "myorg/terraform-modules",
+  "tag": "v2.1.0",
   "module_dir": "modules/networking"
 }
 ```
