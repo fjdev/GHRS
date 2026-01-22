@@ -1,6 +1,5 @@
 # GitHub Repository Sync (GHRS)
 
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/fjdev/ghrs)
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -14,11 +13,11 @@ A professional tool for syncing GitHub repositories (particularly Terraform modu
 - **Parallel Sync**: Sync multiple modules concurrently (bounded worker pool)
 - **Resilient Fetch**: Built-in retries and GitHub rate-limit backoff
 - **Safe Extraction**: Guards against path traversal in archives
-- **Flexible Authentication**: GitHub App or Personal Access Token
+- **Flexible Authentication**: Token from `GITHUB_TOKEN`, `GH_TOKEN`, or `AZURE_DEVOPS_PAT`
 - **Organization Support**: Global organization setting with per-module override
 - **Smart Versioning**: Preserves all versions side-by-side for easy rollback
 - **Production Ready**: Proper logging, error handling, and OOP design
-- **Minimal Dependencies**: Core uses Python standard library (PyJWT optional for GitHub App)
+- **Minimal Dependencies**: Core uses Python standard library only
 
 ## 🚀 Quick Start
 
@@ -84,39 +83,23 @@ Or specify versions directly with `@version` syntax:
 
 - Python 3.7+
 - Git CLI
-- GitHub credentials (optional, for private repos or to avoid rate limits):
-  - GitHub App credentials, OR
-  - Personal Access Token
-- No external Python dependencies for core features
-- Optional: `PyJWT` for GitHub App authentication (`pip install PyJWT`)
+- Token (optional, for private repos or to avoid rate limits): `GITHUB_TOKEN`, `GH_TOKEN`, or `AZURE_DEVOPS_PAT`
+- No external Python dependencies
 
 ## 🔐 Authentication
+GHRS reads a single token from environment variables (first match wins):
 
-GHRS supports two authentication methods:
+1. `GITHUB_TOKEN`
+2. `GH_TOKEN`
+3. `AZURE_DEVOPS_PAT` (fallback for environments that already expose this secret)
 
-### 1. GitHub App (Recommended for Organizations)
-
-Set environment variables:
-
-```bash
-export GITHUB_APP_ID="123456"
-export GITHUB_APP_INSTALLATION_ID="12345678"
-export GITHUB_APP_PRIVATE_KEY_PATH="/path/to/private-key.pem"
-# Or use inline key:
-export GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n..."
-```
-
-### 2. Personal Access Token
+Example:
 
 ```bash
 export GITHUB_TOKEN="ghp_yourtoken"
-# Or:
-export GH_TOKEN="ghp_yourtoken"
 ```
 
-### No Authentication
-
-GHRS works without authentication for public repositories, but may hit GitHub API rate limits.
+Without a token, public repositories still work but may hit GitHub API rate limits.
 
 ## 📊 Configuration File
 
@@ -356,6 +339,130 @@ Download a specific release artifact:
 }
 ```
 
+## 🚀 CI/CD Integration
+
+You can run GHRS in both Azure Pipelines and GitHub Actions. These examples assume:
+- `modules.json` is in repo root
+- `GITHUB_TOKEN` (or a PAT) is available as a secret with repo read access (write if you commit back)
+- Optional: set `GHRS_VERSION` to pin the GHRS script version (defaults to `main` if omitted)
+
+### CI Setup Checklist
+
+- Provide `GITHUB_TOKEN`/PAT with `contents:read` (and `contents:write` if committing)
+- Ensure `modules.json` exists in repo root
+- Pin `GHRS_VERSION` to a released tag for reproducibility
+- Adjust triggers (push paths, schedule) to match your repo
+- If committing back, set git user.name/email in the pipeline
+
+### Azure Pipelines
+
+Add a pipeline like the sample in [sync.yml](sync.yml). Key pieces:
+
+```yaml
+variables:
+  GHRS_VERSION: 'v1.2.0'
+  GHRS_MAX_WORKERS: 4
+
+steps:
+  - checkout: self
+    persistCredentials: true
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.x'
+
+  - script: |
+      python -m pip install --upgrade pip
+      curl -sSfL "https://raw.githubusercontent.com/fjdev/GHRS/$(GHRS_VERSION)/ghrs" -o ghrs
+      chmod +x ghrs
+    displayName: Prepare GHRS
+
+  - script: ./ghrs
+    displayName: Run GHRS
+    env:
+      GITHUB_TOKEN: $(GITHUB_TOKEN)
+      GHRS_MAX_WORKERS: $(GHRS_MAX_WORKERS)
+
+  - script: |
+      git config --global user.email "azure-pipelines@users.noreply.github.com"
+      git config --global user.name "Azure Pipelines"
+      git add modules
+      git commit -m "chore: sync terraform modules [skip ci]" || echo "No changes"
+      git push origin HEAD:$(Build.SourceBranchName)
+    displayName: Commit and push changes
+```
+
+Notes:
+- If you want a scheduled sync, add a `schedules` block (see [sync.yml](sync.yml)).
+- Ensure the service connection/token has `contents: write` if committing.
+- `MODULES_DEST` can be adjusted; default output is `modules/`.
+
+### GitHub Actions
+
+Create `.github/workflows/ghrs.yml`:
+
+```yaml
+name: Sync Terraform Modules
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ["modules.json"]
+    branches: ["main"]
+  schedule:
+    - cron: "0 2 * * *"  # nightly
+
+permissions:
+  contents: write  # needed if you commit/push changes
+
+env:
+  GHRS_VERSION: v1.2.0
+  GHRS_MAX_WORKERS: 4
+  GHRS_HTTP_TIMEOUT: 20
+  GHRS_RETRY_ATTEMPTS: 3
+  GHRS_RETRY_BACKOFF_SECONDS: 1
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Prepare GHRS
+        run: |
+          python -m pip install --upgrade pip
+          curl -sSfL "https://raw.githubusercontent.com/fjdev/GHRS/${GHRS_VERSION}/ghrs" -o ghrs
+          chmod +x ghrs
+
+      - name: Run GHRS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHRS_MAX_WORKERS: ${{ env.GHRS_MAX_WORKERS }}
+          GHRS_HTTP_TIMEOUT: ${{ env.GHRS_HTTP_TIMEOUT }}
+          GHRS_RETRY_ATTEMPTS: ${{ env.GHRS_RETRY_ATTEMPTS }}
+          GHRS_RETRY_BACKOFF_SECONDS: ${{ env.GHRS_RETRY_BACKOFF_SECONDS }}
+        run: ./ghrs
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.email "github-actions@users.noreply.github.com"
+          git config --global user.name "github-actions"
+          git add modules
+          git commit -m "chore: sync terraform modules [skip ci]" || echo "No changes"
+          git push
+```
+
+Notes:
+- The default `GITHUB_TOKEN` works for public repos; for private org-wide access, use a PAT in `secrets.GITHUB_TOKEN`.
+- If you need a different destination, set `destination_root` in `modules.json` and adjust the `git add` path.
+- The workflow watches `modules.json`; adjust triggers as needed.
+
 ## 🛠️ Troubleshooting
 
 ### Common Issues
@@ -382,8 +489,8 @@ echo $GITHUB_TOKEN
 **Rate Limiting (HTTP 403)**
 
 - GitHub has rate limits for unauthenticated requests (60/hour)
-- Configure authentication (GitHub App or PAT)
-- Authenticated requests have 5,000/hour limit
+- Set a token via `GITHUB_TOKEN`, `GH_TOKEN`, or `AZURE_DEVOPS_PAT`
+- Authenticated requests have a 5,000/hour limit
 
 **Download/Release Fetch Failed**
 
