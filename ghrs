@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""
-GitHub Repository Sync (GHRS)
-==============================
-
-A professional tool for syncing GitHub repositories (particularly Terraform modules)
-with version tracking and automated cleanup.
-
-Features:
-- Release-based syncing (latest or tagged)
-- Version tracking with @version suffix
-- Automatic file cleanup (keeps only essential TF files)
-- GitHub App and PAT authentication
-- Configurable organization defaults
-- Robust error handling and logging
-
-Requirements:
-- Python 3.7+
-- Git CLI
-- GitHub credentials (App or PAT)
-- PyJWT (optional, for GitHub App authentication)
-
-Author: fjdev
-License: MIT
-Version: 1.0.0
-"""
+"""Sync GitHub releases into cleaned Terraform module directories."""
 
 # Standard library imports
 from __future__ import annotations
@@ -50,42 +26,39 @@ __version__ = "1.0.0"
 __author__ = "fjdev"
 
 
-# Configuration
-class SyncConfig:
+@dataclass(frozen=True)
+class GHRSConfig:
     """Configuration constants for GHRS."""
-    # Paths
-    ROOT = Path(__file__).resolve().parent
-    CONFIG_FILE = "modules.json"
-    DEFAULT_DEST = "modules"
-    MAX_WORKERS = int(os.environ.get("GHRS_MAX_WORKERS", "4"))
-    HTTP_TIMEOUT = int(os.environ.get("GHRS_HTTP_TIMEOUT", "20"))
-    
-    # GitHub API
-    GITHUB_API = "https://api.github.com"
-    GITHUB_URL = "https://github.com"
-    
-    # Allowed files (all others will be removed)
-    ALLOWED_FILES = {"main.tf", "outputs.tf", "README.md", "terraform.tf", "variables.tf"}
-    
-    # Defaults
-    DEFAULT_MODULE_DIR = "."
-    RETRY_ATTEMPTS = int(os.environ.get("GHRS_RETRY_ATTEMPTS", "3"))
-    RETRY_BACKOFF_SECONDS = int(os.environ.get("GHRS_RETRY_BACKOFF_SECONDS", "1"))
-    
-    # Exit codes
-    EXIT_CODE_SUCCESS = 0
-    EXIT_CODE_ERROR = 1
-    
-    # Logging
-    LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
-    LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+    root: Path = Path(__file__).resolve().parent
+    config_file: str = "modules.json"
+    default_dest: str = "modules"
+    max_workers: int = int(os.environ.get("GHRS_MAX_WORKERS", "4"))
+    http_timeout: int = int(os.environ.get("GHRS_HTTP_TIMEOUT", "20"))
+    github_api: str = "https://api.github.com"
+    allowed_files: frozenset[str] = frozenset({
+        "main.tf",
+        "outputs.tf",
+        "README.md",
+        "terraform.tf",
+        "variables.tf",
+    })
+    default_module_dir: str = "."
+    retry_attempts: int = int(os.environ.get("GHRS_RETRY_ATTEMPTS", "3"))
+    retry_backoff_seconds: int = int(os.environ.get("GHRS_RETRY_BACKOFF_SECONDS", "1"))
+    exit_code_success: int = 0
+    exit_code_error: int = 1
+    log_format: str = '%(asctime)s - %(levelname)s - %(message)s'
+    log_date_format: str = '%Y-%m-%d %H:%M:%S'
+
+
+CONFIG = GHRSConfig()
 
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format=SyncConfig.LOG_FORMAT,
-    datefmt=SyncConfig.LOG_DATE_FORMAT
+    format=CONFIG.log_format,
+    datefmt=CONFIG.log_date_format
 )
 logger = logging.getLogger(__name__)
 
@@ -116,13 +89,8 @@ class ConfigurationError(SyncError):
     pass
 
 
-class GitOperationError(SyncError):
-    """Raised when git operations fail."""
-    pass
-
-
 # Data Models
-@dataclass
+@dataclass(frozen=True)
 class ModuleConfig:
     """Configuration for a single module."""
     name: str
@@ -130,10 +98,10 @@ class ModuleConfig:
     mode: str = "release"
     tag: Optional[str] = None
     asset_name: Optional[str] = None
-    module_dir: str = SyncConfig.DEFAULT_MODULE_DIR
+    module_dir: str = CONFIG.default_module_dir
 
 
-@dataclass
+@dataclass(frozen=True)
 class SyncResult:
     """Result of a sync operation."""
     name: str
@@ -143,96 +111,17 @@ class SyncResult:
     error: Optional[str] = None
 
 
-# Authentication
-class GitHubAuthProvider(ABC):
-    """Abstract base class for GitHub authentication providers."""
-    
-    @abstractmethod
-    def get_token(self) -> Optional[str]:
-        """Get authentication token."""
-        pass
-
-
-class GitHubAppAuthProvider(GitHubAuthProvider):
-    """GitHub App authentication provider."""
-    
-    def get_token(self) -> Optional[str]:
-        """Generate GitHub App installation access token."""
-        app_id = os.environ.get("GITHUB_APP_ID")
-        install_id = os.environ.get("GITHUB_APP_INSTALLATION_ID")
-        private_key_path = os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH")
-        private_key_env = os.environ.get("GITHUB_APP_PRIVATE_KEY")
-        
-        if not all([app_id, install_id]) or not (private_key_path or private_key_env):
-            return None
-        
-        try:
-            import jwt
-        except ImportError:
-            logger.warning("PyJWT not installed. Run: pip install PyJWT")
-            return None
-        
-        # Load private key
-        if private_key_path and Path(private_key_path).exists():
-            with open(private_key_path, "r") as f:
-                private_key = f.read()
-        elif private_key_env:
-            private_key = private_key_env.replace("\\n", "\n")
-        else:
-            logger.warning("Private key not found")
-            return None
-        
-        # Generate JWT
-        now = int(time.time())
-        payload = {
-            "iat": now - 60,
-            "exp": now + (10 * 60),
-            "iss": app_id
-        }
-        jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
-        
-        # Get installation access token
-        url = f"{SyncConfig.GITHUB_API}/app/installations/{install_id}/access_tokens"
-        headers = {
-            "Authorization": f"Bearer {jwt_token}",
-            "Accept": "application/vnd.github+json"
-        }
-        req = Request(url, headers=headers, method="POST")
-        try:
-            with urlopen(req) as r:
-                response_data = decompress_response(r.read())
-                data = json.loads(response_data.decode("utf-8"))
-                return data.get("token")
-        except (HTTPError, URLError) as e:
-            raise AuthenticationError(f"Failed to get GitHub App token: {e}")
-
-
-class PersonalAccessTokenAuthProvider(GitHubAuthProvider):
-    """Personal Access Token authentication provider."""
-    
-    def get_token(self) -> Optional[str]:
-        """Get PAT from environment."""
-        return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-
-
 class AuthenticationManager:
-    """Manages authentication token retrieval."""
-    
-    def __init__(self):
-        self.providers: List[GitHubAuthProvider] = [
-            GitHubAppAuthProvider(),
-            PersonalAccessTokenAuthProvider(),
-        ]
-    
+    """Get token from standard environment variables."""
+
+    ENV_VARS: tuple[str, ...] = ("GITHUB_TOKEN", "GH_TOKEN", "AZURE_DEVOPS_PAT")
+
     def get_token(self) -> Optional[str]:
-        """Try each authentication provider in order."""
-        for provider in self.providers:
-            token = provider.get_token()
+        for env_var in self.ENV_VARS:
+            token = os.environ.get(env_var)
             if token:
-                provider_name = provider.__class__.__name__.replace("AuthProvider", "")
-                logger.info(f"Using {provider_name} authentication")
+                logger.info(f"Using token from {env_var}")
                 return token
-        
         logger.warning("No authentication configured - API rate limits may apply")
         return None
 
@@ -289,7 +178,7 @@ def save_release_notes(dest_dir: Path, release: Dict[str, Any], repo: str, modul
 
 def cleanup_unwanted_files(dest_dir: Path) -> None:
     """Remove all files except the allowed ones and RELEASE_NOTES.md."""
-    allowed = SyncConfig.ALLOWED_FILES | {"RELEASE_NOTES.md"}
+    allowed = set(CONFIG.allowed_files) | {"RELEASE_NOTES.md"}
     for item in dest_dir.iterdir():
         if item.is_file() and item.name not in allowed:
             item.unlink()
@@ -329,31 +218,31 @@ class GitHubDownloader:
             headers["Authorization"] = f"Bearer {self.token}"
         
         req = Request(url, headers=headers)
-        for attempt in range(SyncConfig.RETRY_ATTEMPTS):
+        for attempt in range(CONFIG.retry_attempts):
             try:
-                with urlopen(req, timeout=SyncConfig.HTTP_TIMEOUT) as response, open(dest, "wb") as f:
+                with urlopen(req, timeout=CONFIG.http_timeout) as response, open(dest, "wb") as f:
                     shutil.copyfileobj(response, f)
                 logger.debug(f"Downloaded: {url}")
                 return
             except HTTPError as e:
                 if self._maybe_handle_rate_limit(e):
                     continue
-                if attempt < SyncConfig.RETRY_ATTEMPTS - 1:
-                    time.sleep(SyncConfig.RETRY_BACKOFF_SECONDS * (attempt + 1))
+                if attempt < CONFIG.retry_attempts - 1:
+                    time.sleep(CONFIG.retry_backoff_seconds * (attempt + 1))
                     continue
                 raise DownloadError(f"Download failed: {url}\n{e}")
             except URLError as e:
-                if attempt < SyncConfig.RETRY_ATTEMPTS - 1:
-                    time.sleep(SyncConfig.RETRY_BACKOFF_SECONDS * (attempt + 1))
+                if attempt < CONFIG.retry_attempts - 1:
+                    time.sleep(CONFIG.retry_backoff_seconds * (attempt + 1))
                     continue
                 raise DownloadError(f"Download failed: {url}\n{e}")
     
     def get_release(self, repo: str, tag: Optional[str] = None) -> Dict[str, Any]:
         """Get release information from GitHub API."""
         if tag:
-            url = f"{SyncConfig.GITHUB_API}/repos/{repo}/releases/tags/{tag}"
+            url = f"{CONFIG.github_api}/repos/{repo}/releases/tags/{tag}"
         else:
-            url = f"{SyncConfig.GITHUB_API}/repos/{repo}/releases/latest"
+            url = f"{CONFIG.github_api}/repos/{repo}/releases/latest"
         
         headers = {
             "User-Agent": "ghrs",
@@ -364,21 +253,21 @@ class GitHubDownloader:
             headers["Authorization"] = f"Bearer {self.token}"
         
         req = Request(url, headers=headers)
-        for attempt in range(SyncConfig.RETRY_ATTEMPTS):
+        for attempt in range(CONFIG.retry_attempts):
             try:
-                with urlopen(req, timeout=SyncConfig.HTTP_TIMEOUT) as response:
+                with urlopen(req, timeout=CONFIG.http_timeout) as response:
                     response_data = decompress_response(response.read())
                     return json.loads(response_data.decode("utf-8"))
             except HTTPError as e:
                 if self._maybe_handle_rate_limit(e):
                     continue
-                if attempt < SyncConfig.RETRY_ATTEMPTS - 1:
-                    time.sleep(SyncConfig.RETRY_BACKOFF_SECONDS * (attempt + 1))
+                if attempt < CONFIG.retry_attempts - 1:
+                    time.sleep(CONFIG.retry_backoff_seconds * (attempt + 1))
                     continue
                 raise DownloadError(f"Failed to get release: {url}\n{e}")
             except URLError as e:
-                if attempt < SyncConfig.RETRY_ATTEMPTS - 1:
-                    time.sleep(SyncConfig.RETRY_BACKOFF_SECONDS * (attempt + 1))
+                if attempt < CONFIG.retry_attempts - 1:
+                    time.sleep(CONFIG.retry_backoff_seconds * (attempt + 1))
                     continue
                 raise DownloadError(f"Failed to get release: {url}\n{e}")
 
@@ -602,13 +491,13 @@ class ModuleSyncApplication:
         """Run the sync application."""
         try:
             # Load configuration
-            config = ConfigParser.load_config(self.config_path)
+            config_data = ConfigParser.load_config(self.config_path)
             
             # Setup paths
-            dest_root = SyncConfig.ROOT / config.get("destination_root", SyncConfig.DEFAULT_DEST)
+            dest_root = CONFIG.root / config_data.get("destination_root", CONFIG.default_dest)
             dest_root.mkdir(parents=True, exist_ok=True)
             
-            default_org = config.get("organization")
+            default_org = config_data.get("organization")
             
             # Get authentication
             token = self.auth_manager.get_token()
@@ -621,8 +510,8 @@ class ModuleSyncApplication:
             
             # Sync each module (parallel)
             results: List[SyncResult] = []
-            modules = config.get("modules", [])
-            max_workers = min(SyncConfig.MAX_WORKERS, max(1, len(modules)))
+            modules = config_data.get("modules", [])
+            max_workers = min(CONFIG.max_workers, max(1, len(modules)))
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for entry in modules:
@@ -663,23 +552,23 @@ class ModuleSyncApplication:
             logger.info(f"  Modules synced to: {dest_root}")
             logger.info(f"{'='*60}")
             
-            return SyncConfig.EXIT_CODE_SUCCESS if failed == 0 else SyncConfig.EXIT_CODE_ERROR
-            
+            return CONFIG.exit_code_success if failed == 0 else CONFIG.exit_code_error
+
         except ConfigurationError as e:
             logger.error(f"Configuration error: {e}")
-            return SyncConfig.EXIT_CODE_ERROR
+            return CONFIG.exit_code_error
         except AuthenticationError as e:
             logger.error(f"Authentication error: {e}")
-            return SyncConfig.EXIT_CODE_ERROR
+            return CONFIG.exit_code_error
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
             logger.debug("", exc_info=True)
-            return SyncConfig.EXIT_CODE_ERROR
+            return CONFIG.exit_code_error
 
 
 def main() -> int:
     """Main entry point."""
-    config_path = SyncConfig.ROOT / SyncConfig.CONFIG_FILE
+    config_path = CONFIG.root / CONFIG.config_file
     app = ModuleSyncApplication(config_path)
     return app.run()
 
