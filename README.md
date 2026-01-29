@@ -240,7 +240,10 @@ modules/
     └── ...
 ```
 
+Each module directory also contains a `RELEASE_NOTES.md` file with release metadata and changelog.
+
 ### File Cleanup
+
 
 GHRS automatically keeps only essential files:
 - `main.tf`
@@ -248,6 +251,7 @@ GHRS automatically keeps only essential files:
 - `outputs.tf`
 - `terraform.tf`
 - `README.md`
+- `RELEASE_NOTES.md` (auto-generated with release info)
 
 All other files and directories are removed to keep modules clean.
 
@@ -359,109 +363,89 @@ You can run GHRS in both Azure Pipelines and GitHub Actions. These examples assu
 Add a pipeline like the sample in [sync.yml](sync.yml). Key pieces:
 
 ```yaml
-variables:
-  GHRS_VERSION: 'v1.2.0'
-  GHRS_MAX_WORKERS: 4
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - modules.json
 
-steps:
+schedules:
+  - cron: "0 2 * * *"
+    displayName: Nightly module sync
+    branches:
+      include:
+        - main
+    always: true
+
+pr: none
+
+variables:
+  GHRS_VERSION: 'main'
+  MODULES_DEST: 'terraform/modules'
+
+jobs:
+- job: Sync
+  displayName: Sync Modules
+  timeoutInMinutes: 10
+  pool:
+    vmImage: 'ubuntu-latest'
+  steps:
   - checkout: self
+    displayName: Checkout repository
     persistCredentials: true
 
   - task: UsePythonVersion@0
+    displayName: Use Python 3.x
     inputs:
       versionSpec: '3.x'
 
   - script: |
+      set -e
       python -m pip install --upgrade pip
       curl -sSfL "https://raw.githubusercontent.com/fjdev/GHRS/$(GHRS_VERSION)/ghrs" -o ghrs
       chmod +x ghrs
-    displayName: Prepare GHRS
+    displayName: Install GHRS
 
   - script: ./ghrs
-    displayName: Run GHRS
+    name: RunGHRS
+    displayName: Sync modules with GHRS
     env:
       GITHUB_TOKEN: $(GITHUB_TOKEN)
-      GHRS_MAX_WORKERS: $(GHRS_MAX_WORKERS)
 
   - script: |
+      if [ -d "$(MODULES_DEST)" ] && [ -n "$(ls -A $(MODULES_DEST) 2>/dev/null)" ]; then
+        echo "✓ Modules synced to $(MODULES_DEST)"
+        ls -1 "$(MODULES_DEST)"
+      else
+        echo "No modules found in $(MODULES_DEST)"
+      fi
+    displayName: Verify sync
+
+  - script: |
+      set -e
       git config --global user.email "azure-pipelines@users.noreply.github.com"
       git config --global user.name "Azure Pipelines"
-      git add modules
-      git commit -m "chore: sync terraform modules [skip ci]" || echo "No changes"
-      git push origin HEAD:$(Build.SourceBranchName)
+      git add "$(MODULES_DEST)"
+      
+      if ! git diff --cached --quiet; then
+        MODULE_COUNT=$(find "$(MODULES_DEST)" -maxdepth 1 -type d | tail -n +2 | wc -l | xargs)
+        git commit -m "chore: sync terraform modules [skip ci]" \
+                   -m "Updated ${MODULE_COUNT} module(s) via GHRS $(GHRS_VERSION)"
+        git push origin HEAD:refs/heads/$(Build.SourceBranchName)
+        echo "✓ Pushed ${MODULE_COUNT} module updates"
+      else
+        echo "No changes to commit"
+      fi
     displayName: Commit and push changes
+    condition: succeeded()
 ```
 
 Notes:
 - If you want a scheduled sync, add a `schedules` block (see [sync.yml](sync.yml)).
 - Ensure the service connection/token has `contents: write` if committing.
 - `MODULES_DEST` can be adjusted; default output is `modules/`.
-
-### GitHub Actions
-
-Create `.github/workflows/ghrs.yml`:
-
-```yaml
-name: Sync Terraform Modules
-
-on:
-  workflow_dispatch:
-  push:
-    paths: ["modules.json"]
-    branches: ["main"]
-  schedule:
-    - cron: "0 2 * * *"  # nightly
-
-permissions:
-  contents: write  # needed if you commit/push changes
-
-env:
-  GHRS_VERSION: v1.2.0
-  GHRS_MAX_WORKERS: 4
-  GHRS_HTTP_TIMEOUT: 20
-  GHRS_RETRY_ATTEMPTS: 3
-  GHRS_RETRY_BACKOFF_SECONDS: 1
-
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Prepare GHRS
-        run: |
-          python -m pip install --upgrade pip
-          curl -sSfL "https://raw.githubusercontent.com/fjdev/GHRS/${GHRS_VERSION}/ghrs" -o ghrs
-          chmod +x ghrs
-
-      - name: Run GHRS
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHRS_MAX_WORKERS: ${{ env.GHRS_MAX_WORKERS }}
-          GHRS_HTTP_TIMEOUT: ${{ env.GHRS_HTTP_TIMEOUT }}
-          GHRS_RETRY_ATTEMPTS: ${{ env.GHRS_RETRY_ATTEMPTS }}
-          GHRS_RETRY_BACKOFF_SECONDS: ${{ env.GHRS_RETRY_BACKOFF_SECONDS }}
-        run: ./ghrs
-
-      - name: Commit and push changes
-        run: |
-          git config --global user.email "github-actions@users.noreply.github.com"
-          git config --global user.name "github-actions"
-          git add modules
-          git commit -m "chore: sync terraform modules [skip ci]" || echo "No changes"
-          git push
-```
-
-Notes:
-- The default `GITHUB_TOKEN` works for public repos; for private org-wide access, use a PAT in `secrets.GITHUB_TOKEN`.
-- If you need a different destination, set `destination_root` in `modules.json` and adjust the `git add` path.
-- The workflow watches `modules.json`; adjust triggers as needed.
 
 ## 🛠️ Troubleshooting
 
